@@ -45,7 +45,8 @@ import urllib.error
 import urllib.request
 
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import font as tkfont
+from tkinter import ttk
 
 # ---------------------------------------------------------------------------
 #  Platform detection
@@ -79,6 +80,27 @@ DEFAULT_MODEL = "Anbernic RG DS Plus"
 CHUNK_SIZE = 1 << 20          # 1 MiB streaming granularity
 ZERO_WIPE_BYTES = 10 * 1024 * 1024   # "first 10MB" zeroing on Linux
 
+# ---------------------------------------------------------------------------
+#  Visual theme -- one cohesive palette shared by every widget
+# ---------------------------------------------------------------------------
+BG         = "#eef1f6"   # app canvas
+SURFACE    = "#ffffff"   # cards
+INK        = "#1f2733"   # primary text
+MUTED      = "#697485"   # secondary text
+FAINT      = "#9aa4b2"   # hints / disabled text
+BORDER     = "#dbe1ea"   # hairlines
+ACCENT     = "#f2b134"   # banana amber
+ACCENT_DK  = "#c8860c"   # amber for text-on-light
+ACCENT_HOV = "#f7c257"   # amber hover
+ACCENT_TX  = "#3a2a00"   # text on amber
+HEADER_BG  = "#1d2733"   # dark header slab
+HEADER_TX  = "#ffffff"
+HEADER_SUB = "#aab6c4"
+LOG_BG     = "#161c24"   # activity log
+LOG_TX     = "#d8e0ea"
+LOG_DIM    = "#7f8b9b"
+DANGER     = "#c0392b"
+
 # sudo is resolved once at runtime; an empty list means "we are already root".
 SUDO_PREFIX: list[str] = []
 
@@ -106,6 +128,18 @@ def format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes:d}m {secs:02d}s"
     return f"{secs:d}s"
+
+
+def pick_family(root, preferences: tuple[str, ...], fallback: str) -> str:
+    """Return the first installed font family from `preferences`."""
+    try:
+        available = {name.lower() for name in tkfont.families(root)}
+    except Exception:
+        return fallback
+    for name in preferences:
+        if name.lower() in available:
+            return name
+    return fallback
 
 
 def is_elevated() -> bool:
@@ -1310,8 +1344,9 @@ class BananaFlasherApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.minsize(720, 620)
-        self.geometry("760x680")
+        self.minsize(780, 700)
+        self.geometry("860x780")
+        self.configure(background=BG)
 
         self.queue: queue.Queue = queue.Queue()
         self.privileges = Privileges(self.log)
@@ -1343,134 +1378,274 @@ class BananaFlasherApp(tk.Tk):
 
     # ------------------------------------------------------------------ style
     def _build_style(self) -> None:
+        """Configure a single, cohesive ttk theme (built on 'clam')."""
         style = ttk.Style(self)
         for theme in ("clam", "alt", "default"):
             if theme in style.theme_names():
                 style.theme_use(theme)
                 break
 
-        base = ("Helvetica", 11) if not IS_WINDOWS else ("Segoe UI", 10)
-        self._font_base = base
-        heading = ("Helvetica", 20, "bold") if not IS_WINDOWS else ("Segoe UI", 18, "bold")
-        subheading = ("Helvetica", 10) if not IS_WINDOWS else ("Segoe UI", 9)
-        bold = (base[0], base[1], "bold")
+        # --- typography -----------------------------------------------------
+        ui_family = pick_family(
+            self,
+            ("SF Pro Text", "Helvetica Neue", "Segoe UI Variable", "Segoe UI",
+             "Inter", "Ubuntu", "Cantarell", "Noto Sans", "DejaVu Sans",
+             "Helvetica", "Arial"),
+            "Helvetica",
+        )
+        mono_family = pick_family(
+            self,
+            ("JetBrains Mono", "Fira Code", "SF Mono", "Menlo", "Cascadia Code",
+             "Consolas", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"),
+            "Courier",
+        )
+        self._font_ui = ui_family
+        self._font_mono = mono_family
+        self._font_base = (ui_family, 10)
 
-        style.configure("Heading.TLabel", font=heading)
-        style.configure("Sub.TLabel", font=subheading, foreground="#5b6470")
-        style.configure("Section.TLabel", font=bold)
-        style.configure("Status.TLabel", font=(base[0], base[1] + 1, "bold"))
-        style.configure("Detail.TLabel", foreground="#5b6470")
-        style.configure("TButton", padding=(12, 6))
-        style.configure("Accent.TButton", font=bold, padding=(14, 8))
-        style.configure("TRadiobutton", padding=(4, 3))
-        style.configure("TLabelframe", padding=10)
-        style.configure("TLabelframe.Label", font=bold)
-        style.configure("Horizontal.TProgressbar", thickness=18)
+        f_title = (ui_family, 21, "bold")
+        f_sub = (ui_family, 10)
+        f_body = (ui_family, 10)
+        f_button = (ui_family, 10, "bold")
+        f_status = (ui_family, 13, "bold")
+        f_small = (ui_family, 9)
+
+        # --- base surfaces --------------------------------------------------
+        style.configure(".", background=BG, foreground=INK, font=f_body)
+        style.configure("TFrame", background=BG)
+        style.configure("Card.TFrame", background=SURFACE)
+        style.configure("TLabel", background=BG, foreground=INK, font=f_body)
+        style.configure("Card.TLabel", background=SURFACE, foreground=INK, font=f_body)
+        style.configure("Status.TLabel", background=SURFACE, foreground=INK,
+                        font=f_status)
+        style.configure("Detail.TLabel", background=SURFACE, foreground=MUTED,
+                        font=f_small)
+        style.configure("Hint.TLabel", background=SURFACE, foreground=FAINT,
+                        font=f_small)
+        style.configure("Footer.TLabel", background=BG, foreground=MUTED,
+                        font=f_small)
+        style.configure("TSeparator", background=BORDER)
+
+        # --- header slab ----------------------------------------------------
+        style.configure("Header.TFrame", background=HEADER_BG)
+        style.configure("HeaderTitle.TLabel", background=HEADER_BG,
+                        foreground=HEADER_TX, font=f_title)
+        style.configure("HeaderSub.TLabel", background=HEADER_BG,
+                        foreground=HEADER_SUB, font=f_sub)
+        style.configure("HeaderPill.TLabel", background=HEADER_BG,
+                        foreground=ACCENT, font=(ui_family, 10, "bold"))
+
+        # --- buttons --------------------------------------------------------
+        for name, bg_col, fg_col, border, bw in (
+            ("Accent.TButton", ACCENT, ACCENT_TX, ACCENT, 0),
+            ("Secondary.TButton", SURFACE, INK, BORDER, 1),
+        ):
+            style.configure(
+                name, background=bg_col, foreground=fg_col, font=f_button,
+                padding=(18, 9), borderwidth=bw, relief="solid",
+                bordercolor=border, lightcolor=bg_col, darkcolor=bg_col,
+                focuscolor=bg_col,
+            )
+        style.map(
+            "Accent.TButton",
+            background=[("disabled", "#efd9a6"), ("active", ACCENT_HOV),
+                        ("pressed", ACCENT_DK)],
+            foreground=[("disabled", "#a08c5c")],
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("disabled", SURFACE), ("active", "#eaeef4"),
+                        ("pressed", "#e0e6ee")],
+            foreground=[("disabled", FAINT)],
+            bordercolor=[("active", "#c7cfda")],
+        )
+
+        # --- inputs ---------------------------------------------------------
+        style.configure("TRadiobutton", background=SURFACE, foreground=INK,
+                        font=f_body, padding=(2, 6), indicatorsize=15)
+        style.map(
+            "TRadiobutton",
+            foreground=[("selected", ACCENT_DK), ("active", INK)],
+            background=[("active", SURFACE)],
+        )
+        style.configure("TCheckbutton", background=SURFACE, foreground=MUTED,
+                        font=f_small, padding=(2, 4), indicatorsize=14)
+        style.map(
+            "TCheckbutton",
+            background=[("active", SURFACE)],
+            foreground=[("active", INK)],
+        )
+        style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE,
+                        foreground=INK, bordercolor=BORDER, arrowcolor=MUTED,
+                        lightcolor=SURFACE, darkcolor=SURFACE,
+                        padding=(10, 7), relief="flat")
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", SURFACE), ("disabled", "#f4f6f9")],
+            foreground=[("readonly", INK), ("disabled", FAINT)],
+            bordercolor=[("focus", ACCENT), ("hover", "#c7cfda")],
+            arrowcolor=[("disabled", FAINT)],
+        )
+        style.configure("TEntry", fieldbackground=SURFACE, foreground=INK,
+                        bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE,
+                        padding=(8, 7), relief="flat")
+        style.map("TEntry", bordercolor=[("focus", ACCENT)])
+
+        # --- progress -------------------------------------------------------
+        style.configure("Horizontal.TProgressbar", troughcolor="#e4e9f0",
+                        background=ACCENT, bordercolor="#e4e9f0",
+                        lightcolor=ACCENT, darkcolor=ACCENT, thickness=16)
+        style.configure("Done.Horizontal.TProgressbar", troughcolor="#e4e9f0",
+                        background="#3a9d5d", bordercolor="#e4e9f0",
+                        lightcolor="#3a9d5d", darkcolor="#3a9d5d", thickness=16)
+
+        # --- dark scrollbar for the log ------------------------------------
+        style.configure("Log.Vertical.TScrollbar", background="#2b3644",
+                        troughcolor=LOG_BG, bordercolor=LOG_BG,
+                        arrowcolor=LOG_DIM, lightcolor="#2b3644",
+                        darkcolor="#2b3644", relief="flat")
+        style.map("Log.Vertical.TScrollbar",
+                  background=[("active", "#3a4757")])
+
+        # Keep the combobox dropdown list in theme.
+        self.option_add("*TCombobox*Listbox.background", SURFACE)
+        self.option_add("*TCombobox*Listbox.foreground", INK)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", ACCENT_TX)
+        self.option_add("*TCombobox*Listbox.font", f_body)
+
+    # --- small reusable builders ------------------------------------------
+    def _card(self, parent, step: int, title: str):
+        """A bordered white card with a numbered accent badge and heading."""
+        outer = tk.Frame(parent, bg=SURFACE, bd=0,
+                         highlightbackground=BORDER, highlightthickness=1)
+        outer.pack(fill="x", pady=(0, 14))
+        inner = tk.Frame(outer, bg=SURFACE, padx=18, pady=15)
+        inner.pack(fill="both", expand=True)
+
+        head = tk.Frame(inner, bg=SURFACE)
+        head.pack(fill="x", anchor="w")
+        tk.Label(head, text=str(step), bg=ACCENT, fg=ACCENT_TX,
+                 font=(self._font_ui, 10, "bold"), padx=8, pady=1).pack(side="left")
+        tk.Label(head, text=title, bg=SURFACE, fg=INK,
+                 font=(self._font_ui, 12, "bold")).pack(side="left", padx=(10, 0))
+        return inner
+
+    def _hint(self, parent, text: str, wrap: int):
+        tk.Label(parent, text=text, bg=SURFACE, fg=FAINT,
+                 font=(self._font_ui, 9), justify="left", wraplength=wrap,
+                 anchor="w").pack(fill="x", anchor="w", pady=(8, 0))
 
     # --------------------------------------------------------------------- UI
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=0)
-        root.pack(fill="both", expand=True)
-
-        # ---- header
-        header = ttk.Frame(root, padding=(20, 16, 20, 8))
+        # ---- header slab ---------------------------------------------------
+        header = tk.Frame(self, bg=HEADER_BG)
         header.pack(fill="x")
-        ttk.Label(header, text="🍌 " + APP_NAME, style="Heading.TLabel").pack(anchor="w")
-        ttk.Label(
-            header,
-            text="Flash BananaLinux to a microSD card for the Anbernic RG DS family.",
-            style="Sub.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+        header_inner = tk.Frame(header, bg=HEADER_BG, padx=24, pady=18)
+        header_inner.pack(fill="x")
 
-        body = ttk.Frame(root, padding=(20, 8, 20, 16))
+        left = tk.Frame(header_inner, bg=HEADER_BG)
+        left.pack(side="left", anchor="w")
+        tk.Label(left, text="🍌  " + APP_NAME, bg=HEADER_BG, fg=HEADER_TX,
+                 font=(self._font_ui, 21, "bold")).pack(anchor="w")
+        tk.Label(left, text="Flash BananaLinux to a microSD card for the "
+                            "Anbernic RG DS family.",
+                 bg=HEADER_BG, fg=HEADER_SUB,
+                 font=(self._font_ui, 10)).pack(anchor="w", pady=(3, 0))
+
+        tk.Label(header_inner, text=f"v{APP_VERSION}", bg=HEADER_BG, fg=ACCENT,
+                 font=(self._font_ui, 10, "bold")).pack(side="right", anchor="n")
+
+        # ---- body ----------------------------------------------------------
+        body = tk.Frame(self, bg=BG, padx=24, pady=18)
         body.pack(fill="both", expand=True)
 
-        # ---- step 1 : model
-        model_box = ttk.LabelFrame(body, text=" 1 · Choose your handheld ", padding=12)
-        model_box.pack(fill="x")
+        # ---- step 1 : model ------------------------------------------------
+        model_box = self._card(body, 1, "Choose your handheld")
         for name in MODELS:
             ttk.Radiobutton(
                 model_box, text=name, value=name,
                 variable=self.model_var, command=self._on_model_change,
             ).pack(anchor="w")
-        ttk.Label(
-            model_box, textvariable=self.release_var, style="Detail.TLabel",
-        ).pack(anchor="w", pady=(6, 0))
+        ttk.Label(model_box, textvariable=self.release_var,
+                  style="Detail.TLabel").pack(anchor="w", pady=(8, 0))
 
-        # ---- step 2 : target drive
-        drive_box = ttk.LabelFrame(body, text=" 2 · Select the target drive ", padding=12)
-        drive_box.pack(fill="x", pady=(12, 0))
-
-        drive_row = ttk.Frame(drive_box)
+        # ---- step 2 : target drive ----------------------------------------
+        drive_box = self._card(body, 2, "Select the target drive")
+        drive_row = ttk.Frame(drive_box, style="Card.TFrame")
         drive_row.pack(fill="x")
         self.device_combo = ttk.Combobox(
-            drive_row, textvariable=self.device_var, state="readonly", font=self._font_base,
+            drive_row, textvariable=self.device_var, state="readonly",
+            font=self._font_base,
         )
         self.device_combo.pack(side="left", fill="x", expand=True)
-        self.refresh_btn = ttk.Button(
-            drive_row, text="Refresh", command=self.refresh_devices,
-        )
-        self.refresh_btn.pack(side="left", padx=(8, 0))
+        self.refresh_btn = ttk.Button(drive_row, text="Refresh",
+                                      style="Secondary.TButton",
+                                      command=self.refresh_devices)
+        self.refresh_btn.pack(side="left", padx=(10, 0))
+        self._hint(drive_box,
+                   "Only physical drives are listed. The system/OS disk is "
+                   "detected and cannot be flashed.", 740)
 
-        ttk.Label(
-            drive_box,
-            text="Only physical drives are listed. The system/OS disk is marked and "
-                 "cannot be flashed.",
-            style="Detail.TLabel", wraplength=640, justify="left",
-        ).pack(anchor="w", pady=(6, 0))
-
-        # ---- step 3 : flash
-        action_box = ttk.LabelFrame(body, text=" 3 · Wipe and flash ", padding=12)
-        action_box.pack(fill="x", pady=(12, 0))
-
-        ttk.Label(action_box, textvariable=self.status_var,
-                  style="Status.TLabel").pack(anchor="w")
+        # ---- step 3 : wipe and flash --------------------------------------
+        action_box = self._card(body, 3, "Wipe and flash")
+        self.status_lbl = ttk.Label(action_box, textvariable=self.status_var,
+                                    style="Status.TLabel")
+        self.status_lbl.pack(anchor="w")
         self.progress = ttk.Progressbar(
             action_box, variable=self.progress_var, maximum=100.0,
             mode="determinate", style="Horizontal.TProgressbar",
         )
-        self.progress.pack(fill="x", pady=(8, 4))
+        self.progress.pack(fill="x", pady=(10, 6))
         ttk.Label(action_box, textvariable=self.detail_var,
                   style="Detail.TLabel").pack(anchor="w")
 
-        btn_row = ttk.Frame(action_box)
-        btn_row.pack(fill="x", pady=(10, 0))
-        self.start_btn = ttk.Button(
-            btn_row, text="Download & Flash", style="Accent.TButton",
-            command=self.start_flash,
-        )
+        btn_row = ttk.Frame(action_box, style="Card.TFrame")
+        btn_row.pack(fill="x", pady=(14, 0))
+        self.start_btn = ttk.Button(btn_row, text="Download & Flash",
+                                    style="Accent.TButton",
+                                    command=self.start_flash)
         self.start_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(
-            btn_row, text="Cancel", command=self.cancel_flash, state="disabled",
-        )
-        self.cancel_btn.pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            btn_row, text="Keep downloaded image",
-            variable=self.keep_var,
-        ).pack(side="right")
+        self.cancel_btn = ttk.Button(btn_row, text="Cancel",
+                                     style="Secondary.TButton",
+                                     command=self.cancel_flash, state="disabled")
+        self.cancel_btn.pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(btn_row, text="Keep downloaded image",
+                        variable=self.keep_var).pack(side="right")
 
-        # ---- log
-        log_box = ttk.LabelFrame(body, text=" Log ", padding=8)
-        log_box.pack(fill="both", expand=True, pady=(12, 0))
-        self.log_widget = scrolledtext.ScrolledText(
-            log_box, height=9, wrap="word", state="disabled",
-            font=("Menlo", 9) if IS_MACOS else ("Consolas", 9) if IS_WINDOWS
-            else ("DejaVu Sans Mono", 9),
-            background="#111418", foreground="#d7dde3",
-            insertbackground="#d7dde3", relief="flat", borderwidth=0,
-        )
-        self.log_widget.pack(fill="both", expand=True)
+        # ---- activity log --------------------------------------------------
+        log_outer = tk.Frame(body, bg=SURFACE, bd=0,
+                             highlightbackground=BORDER, highlightthickness=1)
+        log_outer.pack(fill="both", expand=True, pady=(0, 14))
+        log_head = tk.Frame(log_outer, bg=SURFACE, padx=18, pady=0)
+        log_head.pack(fill="x", pady=(12, 0))
+        tk.Label(log_head, text="Activity log", bg=SURFACE, fg=INK,
+                 font=(self._font_ui, 12, "bold")).pack(side="left")
 
-        # ---- footer
-        footer = ttk.Frame(root, padding=(20, 6, 20, 14))
-        footer.pack(fill="x")
-        ttk.Label(
-            footer,
-            text="⚠  Writing to a drive erases everything on it. Double-check the "
-                 "selected device before flashing. BananaLinux is a community "
-                 "project; this tool is unaffiliated with Anbernic.",
-            style="Detail.TLabel", wraplength=700, justify="left",
-        ).pack(anchor="w")
+        log_area = tk.Frame(log_outer, bg=LOG_BG, padx=1, pady=1)
+        log_area.pack(fill="both", expand=True, padx=18, pady=(10, 16))
+        self.log_widget = tk.Text(
+            log_area, height=9, wrap="word", state="disabled",
+            font=(self._font_mono, 9), background=LOG_BG, foreground=LOG_TX,
+            insertbackground=LOG_TX, selectbackground="#33455c",
+            relief="flat", borderwidth=0, padx=12, pady=10,
+        )
+        log_scroll = ttk.Scrollbar(log_area, orient="vertical",
+                                   command=self.log_widget.yview,
+                                   style="Log.Vertical.TScrollbar")
+        self.log_widget.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right", fill="y")
+        self.log_widget.pack(side="left", fill="both", expand=True)
+
+        # ---- footer --------------------------------------------------------
+        tk.Label(
+            self,
+            text="⚠   Writing to a drive erases everything on it — double-check "
+                 "the device above. BananaLinux is a community project; this "
+                 "tool is unaffiliated with Anbernic.",
+            bg=BG, fg=MUTED, font=(self._font_ui, 9), justify="left",
+            wraplength=800, anchor="w", padx=24, pady=12,
+        ).pack(fill="x")
 
     # ------------------------------------------------------------------ utils
     def log(self, message: str) -> None:
@@ -1593,6 +1768,7 @@ class BananaFlasherApp(tk.Tk):
             return
 
         self.progress_var.set(0.0)
+        self.progress.configure(style="Horizontal.TProgressbar")
         self.detail_var.set("")
         self._set_running(True)
         self.log("—" * 60)
@@ -1677,20 +1853,32 @@ class BananaFlasherApp(tk.Tk):
         """Modal password prompt; returns the password or None if cancelled."""
         dialog = tk.Toplevel(self)
         dialog.title("sudo password required")
+        dialog.configure(background=SURFACE)
         dialog.transient(self)
         dialog.resizable(False, False)
         dialog.grab_set()
 
-        ttk.Label(
-            dialog,
-            text="Wiping and writing raw block devices needs elevated rights.\n"
-                 "Enter your password (it is used only to cache a sudo session):",
-            justify="left", padding=(16, 14, 16, 6),
-        ).pack(fill="x")
+        wrap = tk.Frame(dialog, bg=SURFACE, padx=22, pady=18)
+        wrap.pack(fill="both", expand=True)
+
+        head = tk.Frame(wrap, bg=SURFACE)
+        head.pack(fill="x")
+        tk.Label(head, text="🔒", bg=SURFACE, fg=ACCENT_DK,
+                 font=(self._font_ui, 14)).pack(side="left")
+        tk.Label(head, text="Elevated rights required", bg=SURFACE, fg=INK,
+                 font=(self._font_ui, 13, "bold")).pack(side="left", padx=(8, 0))
+
+        tk.Label(
+            wrap,
+            text="Wiping and writing raw block devices needs sudo.\n"
+                 "Your password is used only to cache a sudo session.",
+            bg=SURFACE, fg=MUTED, font=(self._font_ui, 9), justify="left",
+        ).pack(anchor="w", pady=(8, 12))
 
         entry_var = tk.StringVar()
-        entry = ttk.Entry(dialog, textvariable=entry_var, show="•", width=36)
-        entry.pack(fill="x", padx=16)
+        entry = ttk.Entry(wrap, textvariable=entry_var, show="•", width=38,
+                          font=self._font_base)
+        entry.pack(fill="x")
         entry.focus_set()
 
         result: dict = {"value": None}
@@ -1703,11 +1891,12 @@ class BananaFlasherApp(tk.Tk):
             result["value"] = None
             dialog.destroy()
 
-        buttons = ttk.Frame(dialog, padding=(16, 12, 16, 14))
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right")
+        buttons = tk.Frame(wrap, bg=SURFACE)
+        buttons.pack(fill="x", pady=(16, 0))
         ttk.Button(buttons, text="Unlock", style="Accent.TButton",
-                   command=accept).pack(side="right", padx=(0, 8))
+                   command=accept).pack(side="right")
+        ttk.Button(buttons, text="Cancel", style="Secondary.TButton",
+                   command=cancel).pack(side="right", padx=(0, 10))
         dialog.bind("<Return>", accept)
         dialog.bind("<Escape>", cancel)
 
@@ -1742,7 +1931,8 @@ class BananaFlasherApp(tk.Tk):
         if self._indeterminate:
             self.progress.stop()
             self._indeterminate = False
-        self.progress.configure(mode="determinate")
+        self.progress.configure(mode="determinate",
+                                style="Horizontal.TProgressbar")
 
     def _show_error(self, title: str, message: str) -> None:
         from tkinter import messagebox
@@ -1814,6 +2004,7 @@ class BananaFlasherApp(tk.Tk):
 
         self._set_running(False)
         self._reset_progress()
+        self.progress.configure(style="Done.Horizontal.TProgressbar")
         self.progress_var.set(100.0)
         self.detail_var.set(f"Wrote {format_bytes(result['written'])} "
                             f"in {format_duration(result['elapsed'])}")
