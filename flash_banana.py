@@ -130,6 +130,17 @@ def format_duration(seconds: float) -> str:
     return f"{secs:d}s"
 
 
+def resource_path(relative: str) -> str:
+    """
+    Resolve a bundled resource path.
+
+    When frozen by PyInstaller, data files are unpacked to ``sys._MEIPASS``;
+    when running from a checkout, they live next to this script.
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
 def pick_family(root, preferences: tuple[str, ...], fallback: str) -> str:
     """Return the first installed font family from `preferences`."""
     try:
@@ -1348,6 +1359,10 @@ class BananaFlasherApp(tk.Tk):
         self.geometry("860x780")
         self.configure(background=BG)
 
+        # Window / taskbar icon (bundled next to the source, or via PyInstaller).
+        self._icon_image: tk.PhotoImage | None = None
+        self._apply_window_icon()
+
         self.queue: queue.Queue = queue.Queue()
         self.privileges = Privileges(self.log)
         self.devices: list[dict] = []
@@ -1375,6 +1390,21 @@ class BananaFlasherApp(tk.Tk):
         # Initial work
         self.refresh_devices()
         self._query_release_async()
+
+    # --------------------------------------------------------------- branding
+    def _apply_window_icon(self) -> None:
+        """Set the window/taskbar icon from the bundled asset when present."""
+        ico = resource_path(os.path.join("docs", "banana.ico"))
+        png = resource_path(os.path.join("docs", "banana.png"))
+        try:
+            if IS_WINDOWS and os.path.exists(ico):
+                self.iconbitmap(ico)
+            if os.path.exists(png):
+                self._icon_image = tk.PhotoImage(file=png)
+                self.iconphoto(True, self._icon_image)
+        except Exception:
+            # A missing or unreadable icon must never stop the GUI from starting.
+            self._icon_image = None
 
     # ------------------------------------------------------------------ style
     def _build_style(self) -> None:
