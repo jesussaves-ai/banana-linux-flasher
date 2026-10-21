@@ -19,7 +19,9 @@ env:
 
 jobs:
   build-windows:
-    name: Build ${{ env.APP_NAME }}.exe
+    # NOTE: the `env` context is not available in a job's `name`, so the
+    # application name is written literally here.
+    name: Build BananaLinuxFlasher.exe
     runs-on: windows-latest
 
     steps:
