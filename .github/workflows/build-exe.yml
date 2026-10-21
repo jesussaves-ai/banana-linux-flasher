@@ -1,0 +1,71 @@
+name: Build Windows Executable
+
+# Build a standalone, no-console `BananaLinuxFlasher.exe` on every release tag
+# and on demand, then ship it as a build artifact (and a GitHub Release asset
+# when triggered by a tag).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# `contents: write` is required to attach the executable to a GitHub Release.
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  APP_NAME: BananaLinuxFlasher
+
+jobs:
+  build-windows:
+    name: Build ${{ env.APP_NAME }}.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Verify the source compiles
+        run: python -c "import py_compile; py_compile.compile('flash_banana.py', doraise=True)"
+
+      - name: Build the executable with PyInstaller
+        run: pyinstaller --clean --noconfirm BananaLinuxFlasher.spec
+
+      - name: Verify the executable
+        shell: pwsh
+        run: |
+          $exe = "dist/${{ env.APP_NAME }}.exe"
+          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))[0..1]
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "$exe is not a valid Windows PE executable"
+          }
+          $size = (Get-Item $exe).Length
+          Write-Host "Built $exe ($([math]::Round($size / 1MB, 2)) MiB)"
+
+      - name: Upload the executable as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-windows
+          path: dist/${{ env.APP_NAME }}.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach the executable to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.APP_NAME }}.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true

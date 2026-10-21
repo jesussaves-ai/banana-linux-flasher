@@ -1,15 +1,39 @@
 # 🍌 BananaLinux Flasher
 
+[![Build Windows Executable](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-exe.yml/badge.svg)](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-exe.yml)
+
 A small, dependency-free, cross-platform desktop app for flashing
 [BananaLinux](https://github.com/JorreFog/BananaLinux) to a microSD card for the
 **Anbernic RG DS** and **Anbernic RG DS Plus**.
 
 It downloads the newest release straight from GitHub, safely wipes the card's
 partition table, and streams the decompressed disk image directly to the raw
-device. No BalenaEtcher, no Rufus, no extra tooling — just Python's standard
-library.
+device. No BalenaEtcher, no Rufus, no extra tooling.
 
 ![BananaLinux Flasher](docs/screenshot.png)
+
+---
+
+## ⬇️ Download for Windows (recommended)
+
+**No Python required.** Grab the standalone `BananaLinuxFlasher.exe` from the
+[latest GitHub Release](https://github.com/jesussaves-ai/banana-linux-flasher/releases/latest):
+
+1. Open the **Assets** section and download **`BananaLinuxFlasher.exe`**.
+2. Right-click the file → **Run as administrator** (flashing needs raw disk
+   access; the app will also offer to elevate itself if you forget).
+3. Pick your handheld, insert the microSD card, press **Refresh**, select the
+   card, and press **Download & Flash**.
+
+The `.exe` is a single self-contained file — Tkinter, the networking stack and
+the icon are all bundled, so there is nothing else to install. It is built for
+you by [GitHub Actions](.github/workflows/build-exe.yml) on every `v*` tag.
+
+> Windows may show a SmartScreen notice for this unsigned community build.
+> Choose **More info → Run anyway**.
+>
+> Linux and macOS users: run from source (see below). Pre-built binaries are
+> currently published for Windows only.
 
 ---
 
@@ -70,7 +94,12 @@ device — nothing is ever written to an intermediate uncompressed file:
 
 ---
 
-## Requirements
+## Running from source (developers)
+
+> Most users should use the **pre-built Windows executable** at the top of this
+> page. The following instructions are for development and for Linux/macOS use.
+
+### Requirements
 
 * **Python 3.9 or newer** with **Tkinter** (ships with the official installers on
   Windows and macOS).
@@ -81,7 +110,7 @@ device — nothing is ever written to an intermediate uncompressed file:
 * An internet connection to reach the GitHub API.
 * No third-party Python packages. Only the standard library is used.
 
-### Installing Tkinter
+#### Installing Tkinter
 
 | Platform | Command |
 | --- | --- |
@@ -91,9 +120,7 @@ device — nothing is ever written to an intermediate uncompressed file:
 | macOS (Homebrew Python) | `brew install python-tk` |
 | Windows | Included with [python.org](https://www.python.org/downloads/) builds |
 
----
-
-## Setup and running
+### Setup and running
 
 ```bash
 git clone https://github.com/jesussaves-ai/banana-linux-flasher.git
@@ -118,6 +145,27 @@ Then:
 
 If you start the app as root/Administrator directly, the password prompt is
 skipped.
+
+---
+
+## Building the Windows executable
+
+The standalone `BananaLinuxFlasher.exe` is produced from
+[`BananaLinuxFlasher.spec`](BananaLinuxFlasher.spec) — a **one-file, no-console**
+PyInstaller build that bundles Tkinter, the icon and the standard-library
+networking modules.
+
+Build it locally (on Windows) with:
+
+```powershell
+python -m pip install pyinstaller
+pyinstaller --clean --noconfirm BananaLinuxFlasher.spec
+```
+
+The binary is written to `dist\BananaLinuxFlasher.exe`. The same command is run
+automatically by [`.github/workflows/build-exe.yml`](.github/workflows/build-exe.yml),
+which triggers on `v*` tags and manual `workflow_dispatch`, uploads the executable
+as a build artifact, and attaches it to the GitHub Release for tagged builds.
 
 ---
 
@@ -146,6 +194,7 @@ skipped.
 | *"Refusing to flash the system disk"* | The selected drive is the OS/boot disk or holds mounted volumes — pick a different device. |
 | *"Checksum mismatch"* | The download is corrupt or was tampered with. Nothing was written to the card; retry the download. |
 | Windows: *"Could not open \\.\PhysicalDriveN"* | Another program is using the card, or the app is not elevated. Close Explorer windows and retry as Administrator. |
+| Windows: SmartScreen blocks the `.exe` | The release is unsigned. Choose **More info → Run anyway**, or run from source. |
 | macOS: card is busy | The tool unmounts the disk automatically; close any app (Finder, Disk Utility) holding it and retry. |
 | Progress bar behaves oddly on huge images | Uncompressed images larger than 4 GiB exceed the gzip trailer value, so the bar switches to an indeterminate sweep. |
 
