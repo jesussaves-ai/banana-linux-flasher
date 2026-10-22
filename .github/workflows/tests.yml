@@ -1,0 +1,34 @@
+name: Tests
+
+# The Windows flashing path can't run on Linux directly, but its logic is
+# covered by tests that fake the kernel32 / PowerShell boundary. Run them on
+# every push and pull request so regressions are caught without a Windows box.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # flash_banana.py imports Tkinter at module load, so use the runner's
+      # system Python and install the matching Tk binding (no other deps).
+      - name: Install Tkinter
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Verify the source compiles
+        run: python3 -m py_compile flash_banana.py
+
+      - name: Run the test suite
+        run: python3 -m unittest discover -s tests -v

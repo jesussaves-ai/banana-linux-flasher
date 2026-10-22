@@ -61,7 +61,7 @@ DEVNULL = subprocess.DEVNULL
 #  Application / release constants
 # ---------------------------------------------------------------------------
 APP_NAME = "BananaLinux Flasher"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 GITHUB_REPO = "JorreFog/BananaLinux"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -936,6 +936,122 @@ def _wipe_windows(device: dict, log) -> None:
     log("  Target wiped (diskpart clean completed).")
 
 
+# -- Windows: stop the OS from grabbing the card mid-write ------------------
+# Part-way through a raw write the disk's partition table changes. Windows'
+# mount manager notices the "new" volumes, mounts them (they are unrecognised
+# Linux filesystems), pops up "You need to format the disk ...", and -- worst
+# of all -- keeps the volume open. Every subsequent raw write that crosses the
+# mounted volume then fails with ERROR_ACCESS_DENIED (5), which is exactly the
+# crash reported here. Suspending automatic mounting and the shell's hardware
+# detection service for the duration of the destructive step stops Windows
+# from touching the card until we are finished.
+SHELL_HW_SERVICE = "ShellHWDetection"
+
+
+def _powershell(script: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Run a PowerShell snippet, capturing stdout and discarding stderr."""
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _shell_hw_detection_running() -> bool:
+    try:
+        proc = _powershell(
+            f"(Get-Service -Name '{SHELL_HW_SERVICE}' -ErrorAction Stop).Status"
+        )
+        return proc.stdout.strip().lower() == "running"
+    except Exception:
+        return False
+
+
+def _set_shell_hw_detection(running: bool) -> bool:
+    verb = "Start-Service" if running else "Stop-Service -Force"
+    try:
+        proc = _powershell(f"{verb} -Name '{SHELL_HW_SERVICE}' -ErrorAction Stop")
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _automount_enabled() -> bool:
+    """True when Windows is configured to automatically mount new volumes."""
+    try:
+        proc = _powershell(
+            "(Get-ItemProperty -Path "
+            "'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\MountMgr' "
+            "-Name NoAutoMount -ErrorAction Stop).NoAutoMount"
+        )
+        return proc.stdout.strip() != "1"
+    except Exception:
+        # Unknown -- assume the Windows default (enabled) so we restore it.
+        return True
+
+
+def _set_automount(enabled: bool) -> bool:
+    """Enable ('/E') or disable ('/N') automatic mounting of new volumes."""
+    try:
+        proc = subprocess.run(
+            ["mountvol", "/E" if enabled else "/N"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+class WindowsRawAccessGuard:
+    """
+    Temporarily stop Windows from mounting the target disk's volumes.
+
+    Both changes are reverted on exit -- even when the flash fails or is
+    cancelled -- so the host is left exactly as we found it.
+    """
+
+    def __init__(self, log):
+        self._log = log
+        self._stopped_service = False
+        self._disabled_automount = False
+
+    def __enter__(self) -> "WindowsRawAccessGuard":
+        if not IS_WINDOWS:
+            return self
+
+        if _automount_enabled():
+            if _set_automount(False):
+                self._disabled_automount = True
+                self._log("  (paused Windows automatic volume mounting)")
+            else:
+                self._log("  (could not pause automatic volume mounting)")
+        else:
+            self._log("  (automatic volume mounting already disabled)")
+
+        if _shell_hw_detection_running():
+            if _set_shell_hw_detection(False):
+                self._stopped_service = True
+                self._log("  (paused Shell Hardware Detection)")
+            else:
+                self._log("  (could not pause Shell Hardware Detection)")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._stopped_service:
+            if not _set_shell_hw_detection(True):
+                self._log("  WARNING: could not restart Shell Hardware "
+                          "Detection; it will resume on reboot.")
+        if self._disabled_automount:
+            if not _set_automount(True):
+                self._log("  WARNING: could not re-enable automatic volume "
+                          "mounting; it resets on reboot.")
+        return False
+
+
 # ===========================================================================
 #  Streaming flasher -- decompress on the fly straight to the block device
 # ===========================================================================
@@ -1089,6 +1205,11 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
     IOCTL_DISK_UPDATE_PROPERTIES = 0x00070100
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
+    # Win32 error codes that are worth retrying rather than aborting on.
+    ERROR_ACCESS_DENIED = 5
+    ERROR_NOT_READY = 21
+    ERROR_SEM_TIMEOUT = 121
+
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
@@ -1131,29 +1252,61 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
 
     try:
         # Take exclusive control so Windows stops caching/holding the volume.
+        # These control codes are really intended for volume handles, so on a
+        # physical-drive handle they can fail; automatic volume mounting is
+        # instead suppressed by WindowsRawAccessGuard around the pipeline, so
+        # a failure here is reported but not fatal.
         for control in (FSCTL_LOCK_VOLUME, FSCTL_DISMOUNT_VOLUME):
             returned = wintypes.DWORD(0)
-            kernel32.DeviceIoControl(
+            if not kernel32.DeviceIoControl(
                 handle, control, None, 0, None, 0,
                 ctypes.byref(returned), None,
-            )
+            ):
+                log(f"  (DeviceIoControl 0x{control:08X} skipped: "
+                    f"Windows error {ctypes.get_last_error()})")
 
         zero = ctypes.c_longlong(0)
         kernel32.SetFilePointerEx(handle, zero, None, 0)
 
         start_clock = time.monotonic()
 
+        # Position every write explicitly and tolerate short writes and
+        # transient failures. If the OS momentarily grabs a volume we re-seek
+        # to the exact offset and retry instead of desyncing (or aborting) the
+        # whole flash.
+        offset = 0
+        retries_remaining = 8
+
         def write_chunk(chunk: bytes) -> None:
-            buffer = ctypes.create_string_buffer(chunk, len(chunk))
-            written_count = wintypes.DWORD(0)
-            ok = kernel32.WriteFile(
-                handle, buffer, len(chunk),
-                ctypes.byref(written_count), None,
-            )
-            if not ok or written_count.value != len(chunk):
+            nonlocal offset, retries_remaining
+            view = memoryview(chunk)
+            while view:
+                position = ctypes.c_longlong(offset)
+                kernel32.SetFilePointerEx(handle, position, None, 0)
+                buffer = ctypes.create_string_buffer(bytes(view), len(view))
+                written_count = wintypes.DWORD(0)
+                ok = kernel32.WriteFile(
+                    handle, buffer, len(view),
+                    ctypes.byref(written_count), None,
+                )
+                if ok and written_count.value:
+                    offset += written_count.value
+                    view = view[written_count.value:]
+                    retries_remaining = 8
+                    continue
+
                 err = ctypes.get_last_error()
+                if err in (ERROR_ACCESS_DENIED, ERROR_NOT_READY,
+                           ERROR_SEM_TIMEOUT) and retries_remaining:
+                    retries_remaining -= 1
+                    log(f"  Retrying write at {format_bytes(offset)} "
+                        f"(Windows error {err}) ...")
+                    time.sleep(0.5)
+                    continue
+
                 raise FlasherError(
-                    f"Write to {target} failed (Windows error {err}). "
+                    f"Write to {target} failed (Windows error {err}) at "
+                    f"offset {format_bytes(offset)}. "
                     "The card may have been removed or is failing."
                 )
 
@@ -1259,37 +1412,45 @@ class FlashWorker(threading.Thread):
             # ---- 3. Wipe -----------------------------------------------
             self.status("Wiping target drive ...")
             self.progress(0.0, "Wiping partition table and boot area")
-            wipe_device(self.device, self.log)
-            if self.cancel_event.is_set():
-                raise Cancelled()
 
-            # ---- 4. Flash ----------------------------------------------
-            self.status("Flashing image ...")
-            total = gzip_uncompressed_size(image_path)
-            compressed = os.path.getsize(image_path)
-            if total and total < compressed:
-                # The gzip ISIZE trailer is stored modulo 2**32, so an image
-                # larger than 4 GiB reports a wrapped (too small) value. Fall
-                # back to an indeterminate bar rather than lying to the user.
-                self.log("  Uncompressed size exceeds 4 GiB; progress is "
-                         "shown as an estimate.")
-                total = 0
-            self.log(
-                "Streaming decompressed image directly to "
-                f"{self.device['path']} ..."
-            )
+            # On Windows, hold off automatic volume mounting for the whole
+            # destructive step so the freshly written Linux partitions cannot
+            # be grabbed (and the "format this disk" prompt cannot fire) while
+            # we are still streaming. The guard always restores things after.
+            with WindowsRawAccessGuard(self.log):
+                wipe_device(self.device, self.log)
+                if self.cancel_event.is_set():
+                    raise Cancelled()
 
-            start = time.monotonic()
-            written = flash_device(
-                image_path, self.device, total,
-                self._flash_progress, self.cancel_event, self.log,
-            )
-            elapsed = time.monotonic() - start
-            rate = (written / elapsed) if elapsed > 0 else 0
-            summary = f"  Wrote {format_bytes(written)} in {format_duration(elapsed)}"
-            if rate:
-                summary += f"  ({format_bytes(rate)}/s)"
-            self.log(summary + ".")
+                # ---- 4. Flash ------------------------------------------
+                self.status("Flashing image ...")
+                total = gzip_uncompressed_size(image_path)
+                compressed = os.path.getsize(image_path)
+                if total and total < compressed:
+                    # The gzip ISIZE trailer is stored modulo 2**32, so an
+                    # image larger than 4 GiB reports a wrapped (too small)
+                    # value. Fall back to an indeterminate bar rather than
+                    # lying to the user.
+                    self.log("  Uncompressed size exceeds 4 GiB; progress is "
+                             "shown as an estimate.")
+                    total = 0
+                self.log(
+                    "Streaming decompressed image directly to "
+                    f"{self.device['path']} ..."
+                )
+
+                start = time.monotonic()
+                written = flash_device(
+                    image_path, self.device, total,
+                    self._flash_progress, self.cancel_event, self.log,
+                )
+                elapsed = time.monotonic() - start
+                rate = (written / elapsed) if elapsed > 0 else 0
+                summary = (f"  Wrote {format_bytes(written)} in "
+                           f"{format_duration(elapsed)}")
+                if rate:
+                    summary += f"  ({format_bytes(rate)}/s)"
+                self.log(summary + ".")
 
             self.progress(1.0, "Done")
             self.status("Finished.")
