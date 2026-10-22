@@ -90,7 +90,11 @@ device — nothing is ever written to an intermediate uncompressed file:
 * **Linux** — pipes into `sudo dd of=/dev/sdX bs=4M conv=fsync`
 * **macOS** — pipes into `sudo dd of=/dev/rdiskX bs=4m conv=fsync`, then ejects
 * **Windows** — writes chunks to `\\.\PhysicalDriveN` via `CreateFileW` /
-  `WriteFile` / `FlushFileBuffers` (with volume lock + dismount)
+  `WriteFile` / `FlushFileBuffers`, retrying transient failures at the exact
+  byte offset. Automatic volume mounting (`mountvol /N`) and the Shell Hardware
+  Detection service are paused for the duration of the write and restored
+  afterwards, so Windows cannot grab the freshly written Linux partitions
+  mid-flash.
 
 ---
 
@@ -148,6 +152,30 @@ skipped.
 
 ---
 
+## Testing (no Windows PC required)
+
+The Windows flashing path can't run natively on Linux, but its logic is
+covered by tests that replace the `kernel32` / PowerShell / `mountvol`
+boundary with in-memory fakes. This exercises the parts that actually break:
+streaming offsets, short writes, retry-on-`ACCESS_DENIED`, and the
+auto-mount guard's disable-then-always-restore contract.
+
+```bash
+python3 -m unittest discover -s tests -v
+# or, if you have pytest:
+python3 -m pytest tests -v
+```
+
+These run automatically on every push/PR via
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml).
+
+> These tests validate the *logic*, not the real Win32 calls. Confirming the
+> actual raw write and the "format this disk" fix still requires Wine or a real
+> Windows machine with a spare card (the Windows `.exe` cannot be built from
+> Linux — PyInstaller does not cross-compile).
+
+---
+
 ## Building the Windows executable
 
 The standalone `BananaLinuxFlasher.exe` is produced from
@@ -194,6 +222,7 @@ as a build artifact, and attaches it to the GitHub Release for tagged builds.
 | *"Refusing to flash the system disk"* | The selected drive is the OS/boot disk or holds mounted volumes — pick a different device. |
 | *"Checksum mismatch"* | The download is corrupt or was tampered with. Nothing was written to the card; retry the download. |
 | Windows: *"Could not open \\.\PhysicalDriveN"* | Another program is using the card, or the app is not elevated. Close Explorer windows and retry as Administrator. |
+| Windows: *"You need to format the disk"* pop-up, followed by *"Write to \\.\PhysicalDriveN failed (Windows error 5)"* | Windows auto-mounted the new Linux partitions mid-write. The flasher now pauses automatic mounting and Shell Hardware Detection while writing, and retries transient `ACCESS_DENIED` errors, so this should no longer abort a flash. If it still occurs, dismiss the pop-up (never click **Format**) and retry. |
 | Windows: SmartScreen blocks the `.exe` | The release is unsigned. Choose **More info → Run anyway**, or run from source. |
 | macOS: card is busy | The tool unmounts the disk automatically; close any app (Finder, Disk Utility) holding it and retry. |
 | Progress bar behaves oddly on huge images | Uncompressed images larger than 4 GiB exceed the gzip trailer value, so the bar switches to an indeterminate sweep. |
