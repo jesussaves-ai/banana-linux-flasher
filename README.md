@@ -1,6 +1,8 @@
 # 🍌 BananaLinux Flasher
 
 [![Build Windows Executable](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-exe.yml/badge.svg)](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-exe.yml)
+[![Build Linux AppImage](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-appimage.yml/badge.svg)](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/build-appimage.yml)
+[![Tests](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/tests.yml/badge.svg)](https://github.com/jesussaves-ai/banana-linux-flasher/actions/workflows/tests.yml)
 
 A small, dependency-free, cross-platform desktop app for flashing
 [BananaLinux](https://github.com/JorreFog/BananaLinux) to a microSD card for the
@@ -42,14 +44,24 @@ chmod +x BananaLinuxFlasher-*-x86_64.AppImage
 ./BananaLinuxFlasher-*-x86_64.AppImage
 ```
 
-The app asks for your `sudo` password in its own dialog when you start a flash
-(raw device access needs root). It relies on the standard tools `sudo`, `dd`,
-`lsblk`, `wipefs` and `findmnt`, which are present on virtually every desktop
-distro. It is built by [GitHub Actions](.github/workflows/build-appimage.yml)
-on every `v*` tag.
+1. Open the **Assets** section and download the
+   **`BananaLinuxFlasher-<version>-x86_64.AppImage`**, then run the two commands
+   above (or right-click the file → **Properties → Permissions → Allow executing
+   as a program** in your file manager, then double-click it).
+2. Pick your handheld, insert the microSD card, press **Refresh**, and select
+   the card.
+3. Press **Download & Flash**, type your `sudo` password in the app's dialog,
+   and confirm the warning.
 
-> macOS users: run from source (see below). No pre-built macOS binary is
-> published.
+The app asks for your `sudo` password in its own dialog when you start a flash
+(raw device access needs root) and caches it for the duration of the run. It
+relies on the standard tools `sudo`, `dd`, `lsblk`, `wipefs` and `findmnt`,
+which are present on virtually every desktop distro. It is built by
+[GitHub Actions](.github/workflows/build-appimage.yml) on every `v*` tag.
+
+> A graphical desktop session is required (it's a Tk GUI). On a headless
+> machine, run from source instead. macOS users: run from source (see below);
+> no pre-built macOS binary is published.
 
 ---
 
@@ -263,6 +275,10 @@ and CI included).
 | Windows: *"Could not open \\.\PhysicalDriveN"* | Another program is using the card, or the app is not elevated. Close Explorer windows and retry as Administrator. |
 | Windows: *"You need to format the disk"* pop-up, followed by *"Write to \\.\PhysicalDriveN failed (Windows error 5)"* | Windows auto-mounted the new Linux partitions mid-write. The flasher now pauses automatic mounting and Shell Hardware Detection while writing, and retries transient `ACCESS_DENIED` errors, so this should no longer abort a flash. If it still occurs, dismiss the pop-up (never click **Format**) and retry. |
 | Windows: SmartScreen blocks the `.exe` | The release is unsigned. Choose **More info → Run anyway**, or run from source. |
+| Linux: AppImage won't start (*"Permission denied"*) | Make it executable first: `chmod +x BananaLinuxFlasher-*.AppImage`. |
+| Linux: AppImage fails to mount (*FUSE* / *"dlopen"* error) | Run it without FUSE: `./BananaLinuxFlasher-*.AppImage --appimage-extract-and-run`. |
+| Linux: *"Required tool not found: wipefs"* | Install `util-linux` (`sudo apt install util-linux`, `sudo dnf install util-linux`, …); `dd` ships with coreutils. |
+| Linux: *"sudo rejected the password"* | Your account lacks `sudo` rights, or the password was mistyped. If you cannot use `sudo`, launch the app from a root shell. |
 | macOS: card is busy | The tool unmounts the disk automatically; close any app (Finder, Disk Utility) holding it and retry. |
 | Progress bar behaves oddly on huge images | Uncompressed images larger than 4 GiB exceed the gzip trailer value, so the bar switches to an indeterminate sweep. |
 
