@@ -61,7 +61,7 @@ DEVNULL = subprocess.DEVNULL
 #  Application / release constants
 # ---------------------------------------------------------------------------
 APP_NAME = "BananaLinux Flasher"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 GITHUB_REPO = "JorreFog/BananaLinux"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -186,30 +186,15 @@ class Privileges:
       timestamp and keeps it alive in a daemon thread, so the actual flashing
       commands can run non-interactively (`sudo -n`) while stdin stays free for
       the image data.
-    * Windows       : the process must already be elevated; otherwise we offer
-      to relaunch through the UAC prompt.
+    * Windows       : the GUI runs unprivileged and the write elevates itself
+      on demand in a short-lived helper process (see `_spawn_elevated_write`);
+      nothing is handled by this class.
     """
 
     def __init__(self, log):
         self._log = log
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-
-    # -- Windows -----------------------------------------------------------
-    @staticmethod
-    def relaunch_as_admin() -> bool:
-        """Re-launch the current script with the UAC 'runas' verb."""
-        try:
-            import ctypes
-
-            params = " ".join(f'"{arg}"' for arg in sys.argv)
-            rc = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, params, None, 1
-            )
-            return int(rc) > 32
-        except Exception as exc:  # pragma: no cover - Windows only
-            print(f"Could not elevate: {exc}", file=sys.stderr)
-            return False
 
     # -- POSIX -------------------------------------------------------------
     def cache_sudo(self, password: str) -> bool:
@@ -1491,6 +1476,293 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
 
 
 # ===========================================================================
+#  Windows on-demand elevation (privileged helper process)
+# ===========================================================================
+# Rather than forcing the whole Tk application to run as Administrator, the GUI
+# stays a normal unprivileged process. Only when the user actually starts a
+# flash do we spawn a short-lived, GUI-less helper through the UAC "runas"
+# verb. The helper performs the privileged steps (raw handle, volume
+# dismounting, image writing) and streams progress back to the GUI over a
+# newline-delimited JSON status file. The download and checksum verification
+# stay in the unprivileged parent; the helper only receives the already
+# downloaded image path and the target drive index.
+PRIVILEGED_WRITE_FLAG = "--privileged-write"
+ERROR_CANCELLED = 1223  # UAC prompt dismissed
+
+
+def _stderr(message: str) -> None:
+    """Best-effort stderr write (a windowed PyInstaller build has no console)."""
+    if sys.stderr is not None:
+        try:
+            print(message, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+
+def _append_json_line(path: str, payload: dict) -> None:
+    """Append one JSON event to `path`, flushing so the reader sees it soon."""
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+            handle.flush()
+    except OSError:
+        pass
+
+
+def _read_status_updates(path: str, offset: int, on_event) -> int:
+    """
+    Read complete newline-delimited JSON events appended to `path`.
+
+    Returns the new byte offset. An incomplete trailing line is left for the
+    next poll, so the reader never sees a half-written event.
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            data = handle.read()
+    except OSError:
+        return offset
+    if not data:
+        return offset
+    consumed = data.rfind(b"\n")
+    if consumed == -1:
+        return offset
+    for raw in data[:consumed].split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            on_event(json.loads(raw.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return offset + consumed + 1
+
+
+def _dispatch_worker_event(event: dict, progress, status_cb, log) -> None:
+    """Translate one helper event into the parent's callbacks."""
+    kind = event.get("kind")
+    if kind == "progress":
+        progress(int(event.get("done") or 0),
+                 int(event.get("total") or 0),
+                 float(event.get("elapsed") or 0.0))
+    elif kind == "status":
+        status_cb(str(event.get("message") or ""))
+    elif kind == "log":
+        log(str(event.get("message") or ""))
+
+
+def _read_worker_result(path: str | None) -> dict:
+    """Read the helper's final result file, or a synthetic failure."""
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                result = json.load(handle)
+            if isinstance(result, dict):
+                return result
+        except (OSError, ValueError):
+            pass
+    return {"ok": False,
+            "error": "The elevated helper exited without reporting a result."}
+
+
+def _privileged_write_main(request_path: str) -> int:
+    """
+    Entry point for the elevated helper process (no GUI).
+
+    Reads a JSON request, performs the wipe + raw write, reports progress via
+    the status file, and always writes a result file so the parent can tell
+    success, failure and refusal apart.
+    """
+    try:
+        with open(request_path, "r", encoding="utf-8") as handle:
+            request = json.load(handle)
+    except Exception as exc:  # pragma: no cover - defensive
+        _stderr(f"privileged worker: could not read request: {exc}")
+        return 2
+
+    status_path = request.get("status_file")
+    log_path = request.get("log_file")
+    result_path = request.get("result_file")
+    cancel_event = threading.Event()
+
+    def emit(payload: dict) -> None:
+        if status_path:
+            _append_json_line(status_path, payload)
+
+    def log(message: str) -> None:
+        message = message.rstrip()
+        if log_path:
+            try:
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(message + "\n")
+            except OSError:
+                pass
+        emit({"kind": "log", "message": message})
+        if sys.stdout is not None:
+            try:
+                print(message, flush=True)
+            except Exception:
+                pass
+
+    def finish(ok: bool, **fields) -> int:
+        if result_path:
+            try:
+                with open(result_path, "w", encoding="utf-8") as handle:
+                    json.dump({"ok": ok, **fields}, handle)
+            except OSError:
+                pass
+        return 0 if ok else 1
+
+    try:
+        if not is_elevated():
+            log("Refusing to run: the helper process is not elevated.")
+            return finish(False, error="The helper process is not elevated.")
+
+        image_path = request["image"]
+        device = request["device"]
+        total = int(request.get("total") or 0)
+
+        if device.get("protected"):
+            log("Refusing to write to a protected/system disk.")
+            return finish(False, error="Refusing to write to the system disk.")
+        if not str(device.get("path", "")).startswith("\\\\.\\PhysicalDrive"):
+            log(f"Refusing to write to an unexpected target: {device.get('path')}")
+            return finish(False, error="Refusing to write to that target.")
+        if not os.path.isfile(image_path):
+            log(f"Image file is missing: {image_path}")
+            return finish(False, error="The downloaded image file is missing.")
+
+        log(f"Elevated helper started (PhysicalDrive{device.get('index')}).")
+        emit({"kind": "status", "message": "Wiping target drive ..."})
+        with WindowsRawAccessGuard(log):
+            wipe_device(device, log)
+            if cancel_event.is_set():
+                raise Cancelled()
+            emit({"kind": "status", "message": "Flashing image ..."})
+            written = flash_device(
+                image_path, device, total,
+                lambda done, tot, elapsed: emit({
+                    "kind": "progress", "done": done,
+                    "total": tot, "elapsed": elapsed,
+                }),
+                cancel_event, log,
+            )
+        emit({"kind": "done", "written": written})
+        return finish(True, written=written)
+    except Cancelled:
+        log("Cancelled.")
+        return finish(False, error="Cancelled.", cancelled=True)
+    except FlasherError as exc:
+        log(f"ERROR: {exc}")
+        return finish(False, error=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive
+        import traceback
+        log("UNEXPECTED ERROR:\n" + traceback.format_exc())
+        return finish(False, error=f"Unexpected error: {exc}")
+
+
+def _spawn_elevated_write(request_path: str, status_path: str,
+                          result_path: str, progress, status_cb, log,
+                          cancel: threading.Event) -> int:
+    """
+    Launch the privileged helper via UAC and relay its progress.
+
+    Returns the number of bytes written. Raises FlasherError when the helper
+    fails (including a dismissed UAC prompt) and Cancelled when the user
+    cancels mid-write.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SEE_MASK_NOASYNC = 0x00000100
+    SW_HIDE = 0
+    WAIT_OBJECT_0 = 0x00000000
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", wintypes.ULONG),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    params = [PRIVILEGED_WRITE_FLAG, request_path]
+    if not getattr(sys, "frozen", False):
+        # Running from source: relaunch the interpreter on this same script.
+        params.insert(0, os.path.abspath(__file__))
+
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    info.lpVerb = "runas"
+    info.lpFile = sys.executable
+    info.lpParameters = subprocess.list2cmdline(params)
+    info.lpDirectory = None
+    info.nShow = SW_HIDE
+
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        if err == ERROR_CANCELLED:
+            raise FlasherError(
+                "Administrator rights are required to write the card, but the "
+                "UAC prompt was dismissed. Nothing was written."
+            )
+        raise FlasherError(
+            f"Could not start the elevated helper (Windows error {err})."
+        )
+
+    process = info.hProcess
+    offset = 0
+    try:
+        while True:
+            if cancel.is_set():
+                kernel32.TerminateProcess(process, 1)
+                raise Cancelled()
+            offset = _read_status_updates(
+                status_path, offset,
+                lambda event: _dispatch_worker_event(
+                    event, progress, status_cb, log),
+            )
+            if kernel32.WaitForSingleObject(process, 100) == WAIT_OBJECT_0:
+                break
+        # Drain anything the helper wrote just before exiting.
+        _read_status_updates(
+            status_path, offset,
+            lambda event: _dispatch_worker_event(
+                event, progress, status_cb, log),
+        )
+    finally:
+        kernel32.CloseHandle(process)
+
+    result = _read_worker_result(result_path)
+    if not result.get("ok"):
+        raise FlasherError(result.get("error") or "The elevated helper failed.")
+    return int(result.get("written") or 0)
+
+
+# ===========================================================================
 #  Background worker -- runs the whole download/wipe/flash pipeline
 # ===========================================================================
 class FlashWorker(threading.Thread):
@@ -1524,6 +1796,7 @@ class FlashWorker(threading.Thread):
         image_path = None
         try:
             tmpdir = tempfile.mkdtemp(prefix="banana-flasher_")
+            self._workdir = tmpdir
             image_path = os.path.join(tmpdir, self.asset_name)
 
             # ---- 1. Download -------------------------------------------
@@ -1562,51 +1835,55 @@ class FlashWorker(threading.Thread):
                 self.log(f"  No published checksum; computed {actual[:16]}…")
 
             # ---- 2. Privileges -----------------------------------------
+            # On Windows the write is elevated on demand (see _flash_elevated);
+            # elsewhere sudo must already be cached.
             if not is_elevated() and not SUDO_PREFIX and not IS_WINDOWS:
                 raise FlasherError("Elevated privileges are required to flash.")
 
-            # ---- 3. Wipe -----------------------------------------------
+            # ---- 3. Wipe + 4. Flash ------------------------------------
             self.status("Wiping target drive ...")
             self.progress(0.0, "Wiping partition table and boot area")
 
-            # On Windows, hold off automatic volume mounting for the whole
-            # destructive step so the freshly written Linux partitions cannot
-            # be grabbed (and the "format this disk" prompt cannot fire) while
-            # we are still streaming. The guard always restores things after.
-            with WindowsRawAccessGuard(self.log):
-                wipe_device(self.device, self.log)
-                if self.cancel_event.is_set():
-                    raise Cancelled()
+            total = gzip_uncompressed_size(image_path)
+            compressed = os.path.getsize(image_path)
+            if total and total < compressed:
+                # The gzip ISIZE trailer is stored modulo 2**32, so an image
+                # larger than 4 GiB reports a wrapped (too small) value. Fall
+                # back to an indeterminate bar rather than lying to the user.
+                self.log("  Uncompressed size exceeds 4 GiB; progress is "
+                         "shown as an estimate.")
+                total = 0
 
-                # ---- 4. Flash ------------------------------------------
-                self.status("Flashing image ...")
-                total = gzip_uncompressed_size(image_path)
-                compressed = os.path.getsize(image_path)
-                if total and total < compressed:
-                    # The gzip ISIZE trailer is stored modulo 2**32, so an
-                    # image larger than 4 GiB reports a wrapped (too small)
-                    # value. Fall back to an indeterminate bar rather than
-                    # lying to the user.
-                    self.log("  Uncompressed size exceeds 4 GiB; progress is "
-                             "shown as an estimate.")
-                    total = 0
-                self.log(
-                    "Streaming decompressed image directly to "
-                    f"{self.device['path']} ..."
-                )
+            if IS_WINDOWS and not is_elevated():
+                written, elapsed = self._flash_elevated(image_path, total)
+            else:
+                # On Windows, hold off automatic volume mounting for the whole
+                # destructive step so the freshly written Linux partitions
+                # cannot be grabbed (and the "format this disk" prompt cannot
+                # fire) while we are still streaming. The guard restores things
+                # afterwards.
+                with WindowsRawAccessGuard(self.log):
+                    wipe_device(self.device, self.log)
+                    if self.cancel_event.is_set():
+                        raise Cancelled()
+                    self.status("Flashing image ...")
+                    self.log(
+                        "Streaming decompressed image directly to "
+                        f"{self.device['path']} ..."
+                    )
+                    start = time.monotonic()
+                    written = flash_device(
+                        image_path, self.device, total,
+                        self._flash_progress, self.cancel_event, self.log,
+                    )
+                    elapsed = time.monotonic() - start
 
-                start = time.monotonic()
-                written = flash_device(
-                    image_path, self.device, total,
-                    self._flash_progress, self.cancel_event, self.log,
-                )
-                elapsed = time.monotonic() - start
-                rate = (written / elapsed) if elapsed > 0 else 0
-                summary = (f"  Wrote {format_bytes(written)} in "
-                           f"{format_duration(elapsed)}")
-                if rate:
-                    summary += f"  ({format_bytes(rate)}/s)"
-                self.log(summary + ".")
+            rate = (written / elapsed) if elapsed > 0 else 0
+            summary = (f"  Wrote {format_bytes(written)} in "
+                       f"{format_duration(elapsed)}")
+            if rate:
+                summary += f"  ({format_bytes(rate)}/s)"
+            self.log(summary + ".")
 
             self.progress(1.0, "Done")
             self.status("Finished.")
@@ -1638,6 +1915,39 @@ class FlashWorker(threading.Thread):
                     self.log(f"Keeping the downloaded image at: {image_path}")
                 else:
                     shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _flash_elevated(self, image_path: str, total: int):
+        """
+        Wipe + write through an elevated helper process.
+
+        The GUI (this process) is unprivileged; the helper is launched through
+        the UAC "runas" verb, performs the destructive steps, and reports
+        progress back through a status file. Returns (written, elapsed).
+        """
+        request_path = os.path.join(self._workdir, "request.json")
+        status_path = os.path.join(self._workdir, "status.ndjson")
+        result_path = os.path.join(self._workdir, "result.json")
+        request = {
+            "image": image_path,
+            "device": self.device,
+            "total": total,
+            "status_file": status_path,
+            "result_file": result_path,
+            "log_file": os.path.join(self._workdir, "worker.log"),
+        }
+        with open(request_path, "w", encoding="utf-8") as handle:
+            json.dump(request, handle)
+
+        self.status("Waiting for administrator approval ...")
+        self.log("Administrator rights are not held; requesting elevation for "
+                 "the write only (a UAC prompt will appear).")
+
+        start = time.monotonic()
+        written = _spawn_elevated_write(
+            request_path, status_path, result_path,
+            self._flash_progress, self.status, self.log, self.cancel_event,
+        )
+        return written, time.monotonic() - start
 
     # -- progress adapters -------------------------------------------------
     def _download_progress(self, done: int, total: int) -> None:
@@ -2157,36 +2467,21 @@ class BananaFlasherApp(tk.Tk):
             self.log("Elevated privileges detected.")
             return
         if IS_WINDOWS:
-            self.log("WARNING: not running as Administrator. Writing to a "
-                     "physical drive requires elevation -- you will be "
-                     "prompted to relaunch when you start a flash.")
+            self.log("Running as a standard user. Administrator rights (UAC) "
+                     "are requested only when you start a flash.")
         else:
             self.log("Not running as root; you will be asked for your sudo "
                      "password when you start a flash.")
 
     def _ensure_privileges(self) -> bool:
-        from tkinter import messagebox
-
         if IS_WINDOWS:
-            if is_elevated():
-                return True
-            if messagebox.askyesno(
-                "Administrator rights required",
-                "Flashing a physical drive on Windows requires Administrator "
-                "rights.\n\nRelaunch the app elevated now?",
-                icon="warning",
-            ):
-                if Privileges.relaunch_as_admin():
-                    self._on_close(silent=True)
-                    self.after(50, self.destroy)
-                else:
-                    self._show_error(
-                        "Elevation failed",
-                        "Windows refused to elevate the application. Please "
-                        "right-click the script/app and choose 'Run as "
-                        "administrator'.",
-                    )
-            return False
+            # The GUI intentionally stays unprivileged: the destructive step
+            # elevates itself on demand through a UAC prompt when the flash
+            # starts, so there is nothing to prepare here.
+            if not is_elevated():
+                self.log("Running without Administrator rights; the write will "
+                         "request elevation via UAC when it starts.")
+            return True
 
         if is_elevated():
             global SUDO_PREFIX
@@ -2405,6 +2700,11 @@ class BananaFlasherApp(tk.Tk):
 #  Entry point
 # ===========================================================================
 def main() -> int:
+    # Elevated helper mode: no GUI, just the privileged wipe + write. The GUI
+    # spawns us this way via the UAC "runas" verb (see _spawn_elevated_write).
+    if len(sys.argv) >= 3 and sys.argv[1] == PRIVILEGED_WRITE_FLAG:
+        return _privileged_write_main(sys.argv[2])
+
     try:
         app = BananaFlasherApp()
     except tk.TclError as exc:

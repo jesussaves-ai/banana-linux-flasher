@@ -22,10 +22,12 @@ device. No BalenaEtcher, no Rufus, no extra tooling.
 [latest GitHub Release](https://github.com/jesussaves-ai/banana-linux-flasher/releases/latest):
 
 1. Open the **Assets** section and download **`BananaLinuxFlasher.exe`**.
-2. Right-click the file → **Run as administrator** (flashing needs raw disk
-   access; the app will also offer to elevate itself if you forget).
+2. Double-click it to run — **you do not need to run the whole app as
+   Administrator.** The GUI runs as a normal user and only asks for elevation
+   (a UAC prompt) at the moment you start a flash.
 3. Pick your handheld, insert the microSD card, press **Refresh**, select the
-   card, and press **Download & Flash**.
+   card, and press **Download & Flash**. Approve the UAC prompt when it
+   appears.
 
 The `.exe` is a single self-contained file — Tkinter, the networking stack and
 the icon are all bundled, so there is nothing else to install. It is built for
@@ -125,7 +127,9 @@ device — nothing is ever written to an intermediate uncompressed file:
   holds those locks until the flash finishes. Automatic volume mounting
   (`mountvol /N`) and the Shell Hardware Detection service are also paused for
   the duration and restored afterwards, so Windows cannot grab the freshly
-  written Linux partitions mid-flash.
+  written Linux partitions mid-flash. The whole write runs in an **elevated
+  helper process** (see below) rather than requiring the GUI to be an
+  Administrator.
 
 ---
 
@@ -264,6 +268,40 @@ and CI included).
 
 ---
 
+## On-demand elevation (Windows)
+
+The GUI deliberately runs **unprivileged** — device enumeration and the image
+download need no special rights, so there is no reason to run the whole app as
+Administrator. Only the destructive step is elevated, and only when you ask for
+it:
+
+1. The unprivileged GUI downloads the image and verifies its checksum.
+2. When you press **Download & Flash**, it writes a small JSON *request* (image
+   path, target drive index, and the paths of the status/result files) into its
+   private temp directory.
+3. It checks `ctypes.windll.shell32.IsUserAnAdmin()`. If already elevated, the
+   write runs in-process. Otherwise it launches
+   `flash_banana.py --privileged-write <request>` through `ShellExecuteExW` with
+   the `"runas"` verb, which shows the UAC prompt. Running from a PyInstaller
+   build, the same `.exe` is relaunched in helper mode.
+4. The **helper** (a GUI-less process) re-checks that it is elevated, refuses
+   protected/system disks and unexpected targets, then performs the wipe +
+   volume locking + raw write. It appends newline-delimited JSON events
+   (`status`, `progress`, `log`, `done`) to the status file and writes a final
+   `result.json`.
+5. The GUI polls the status file on the background thread, relaying progress to
+   the Tk progress bar and log, and waits on the helper's process handle. A
+   dismissed UAC prompt, a helper failure, or Cancel (which terminates the
+   helper) are all surfaced cleanly.
+
+The hand-off uses files inside a per-user temp directory rather than an
+inherited pipe, which keeps the worker independent of the parent's stdio
+(a windowed `.exe` has no console) and makes progress resilient to the parent
+being busy. The worker also re-validates the target, so a tampered request
+cannot be pointed at the system disk.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -274,6 +312,8 @@ and CI included).
 | *"Checksum mismatch"* | The download is corrupt or was tampered with. Nothing was written to the card; retry the download. |
 | Windows: *"Could not open \\.\PhysicalDriveN"* | Another program is using the card, or the app is not elevated. Close Explorer windows and retry as Administrator. |
 | Windows: *"You need to format the disk"* pop-up, followed by *"Write to \\.\PhysicalDriveN failed (Windows error 5)"* | Windows auto-mounted the new Linux partitions mid-write. The flasher now pauses automatic mounting and Shell Hardware Detection while writing, and retries transient `ACCESS_DENIED` errors, so this should no longer abort a flash. If it still occurs, dismiss the pop-up (never click **Format**) and retry. |
+| Windows: *"Administrator rights are required … UAC prompt was dismissed"* | You declined the elevation prompt. Press **Download & Flash** again and choose **Yes** on the UAC dialog. |
+| Windows: *"Could not start the elevated helper"* | The UAC elevation failed (group policy, disabled UAC, or a locked-down account). Try running the app from an Administrator account. |
 | Windows: SmartScreen blocks the `.exe` | The release is unsigned. Choose **More info → Run anyway**, or run from source. |
 | Linux: AppImage won't start (*"Permission denied"*) | Make it executable first: `chmod +x BananaLinuxFlasher-*.AppImage`. |
 | Linux: AppImage fails to mount (*FUSE* / *"dlopen"* error) | Run it without FUSE: `./BananaLinuxFlasher-*.AppImage --appimage-extract-and-run`. |
