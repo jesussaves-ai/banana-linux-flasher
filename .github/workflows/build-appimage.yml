@@ -1,0 +1,68 @@
+name: Build Linux AppImage
+
+# Build a portable Linux AppImage on every release tag and on demand, then
+# ship it as a build artifact (and a GitHub Release asset for tagged builds).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: BananaLinuxFlasher
+
+jobs:
+  build-appimage:
+    name: Build BananaLinuxFlasher AppImage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # The app imports Tkinter, so use the system Python + Tk binding, then a
+      # venv for PyInstaller (avoids Ubuntu's "externally managed" pip guard).
+      - name: Install Tkinter
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Create venv and install PyInstaller
+        run: |
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install --upgrade pip pyinstaller
+
+      - name: Build the AppImage
+        run: |
+          source "$HOME/venv/bin/activate"
+          chmod +x scripts/build_appimage.sh
+          scripts/build_appimage.sh
+
+      - name: Verify the AppImage
+        run: |
+          APPIMAGE=$(ls dist/*.AppImage | head -n1)
+          test -x "$APPIMAGE" || { echo "not executable: $APPIMAGE"; exit 1; }
+          # Extract to prove the payload is a valid AppImage without needing FUSE.
+          "$APPIMAGE" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          test -x squashfs-root/usr/bin/BananaLinuxFlasher
+          rm -rf squashfs-root
+          echo "Built $APPIMAGE ($(du -h "$APPIMAGE" | cut -f1))"
+
+      - name: Upload the AppImage as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-linux-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach the AppImage to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.AppImage
+          fail_on_unmatched_files: true

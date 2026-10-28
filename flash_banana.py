@@ -61,7 +61,7 @@ DEVNULL = subprocess.DEVNULL
 #  Application / release constants
 # ---------------------------------------------------------------------------
 APP_NAME = "BananaLinux Flasher"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 GITHUB_REPO = "JorreFog/BananaLinux"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -771,16 +771,16 @@ def _list_devices_windows() -> list[dict]:
     if not records:
         # Blind fallback: probe the 16 conventional physical drive handles.
         for index in range(16):
-            devices.append(
-                _device(
-                    path=rf"\\.\PhysicalDrive{index}",
-                    raw=rf"\\.\PhysicalDrive{index}",
-                    label=rf"\\.\PhysicalDrive{index}  (device handle)",
-                    size=0,
-                    removable=False,
-                    protected=(index == system_disk),
-                )
+            device = _device(
+                path=rf"\\.\PhysicalDrive{index}",
+                raw=rf"\\.\PhysicalDrive{index}",
+                label=rf"\\.\PhysicalDrive{index}  (device handle)",
+                size=0,
+                removable=False,
+                protected=(index == system_disk),
             )
+            device["index"] = index
+            devices.append(device)
         return devices
 
     for rec in records:
@@ -1187,6 +1187,159 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
+# -- Windows: lock + dismount the disk's volumes ----------------------------
+# A raw write to \\.\PhysicalDriveN fails with ERROR_ACCESS_DENIED (5) as soon
+# as it crosses the extents of a *mounted* volume -- typically the first
+# partition of a card that still carries a FAT/exFAT filesystem, which is why
+# the failure tends to appear part-way through (e.g. "at 19.0 MiB"). Locking
+# and force-dismounting every volume on the disk before we start, and keeping
+# those locks held until the write finishes, takes the file-system driver out
+# of the picture so the raw stream is never refused.
+def _lock_and_dismount_volumes(kernel32, disk_number: int, log, quiet: bool = False):
+    """
+    Open every volume that lives on `disk_number`, lock + force-dismount it,
+    and return the still-open volume handles (caller must release them).
+
+    Best-effort: a volume that refuses to lock (e.g. in use) is logged and
+    skipped, and the flash continues.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+    FSCTL_LOCK_VOLUME = 0x00090018
+    FSCTL_DISMOUNT_VOLUME = 0x00090020
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class DISK_EXTENT(ctypes.Structure):
+        _fields_ = [
+            ("DiskNumber", wintypes.DWORD),
+            ("StartingOffset", ctypes.c_longlong),
+            ("ExtentLength", ctypes.c_longlong),
+        ]
+
+    class VOLUME_DISK_EXTENTS(ctypes.Structure):
+        _fields_ = [
+            ("NumberOfDiskExtents", wintypes.DWORD),
+            ("Extents", DISK_EXTENT * 32),
+        ]
+
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+    ]
+    kernel32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
+    kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.FindNextVolumeW.restype = wintypes.BOOL
+    kernel32.FindNextVolumeW.argtypes = [
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+    ]
+    kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+
+    locked: list = []
+    buffer = ctypes.create_unicode_buffer(260)
+    find = kernel32.FindFirstVolumeW(buffer, len(buffer))
+    if find == INVALID_HANDLE_VALUE or find is None:
+        if not quiet:
+            log("  (could not enumerate volumes: Windows error "
+                f"{ctypes.get_last_error()})")
+        return locked
+
+    try:
+        while True:
+            name = buffer.value
+            volume = kernel32.CreateFileW(
+                name,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None,
+            )
+            if volume != INVALID_HANDLE_VALUE and volume is not None:
+                extents = VOLUME_DISK_EXTENTS()
+                returned = wintypes.DWORD(0)
+                queried = kernel32.DeviceIoControl(
+                    volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                    None, 0, ctypes.byref(extents), ctypes.sizeof(extents),
+                    ctypes.byref(returned), None,
+                )
+                on_disk = queried and extents.NumberOfDiskExtents and any(
+                    extents.Extents[i].DiskNumber == disk_number
+                    for i in range(min(extents.NumberOfDiskExtents,
+                                       len(extents.Extents)))
+                )
+                if on_disk and _lock_volume(kernel32, volume, name, log):
+                    locked.append(volume)   # keep the handle open (locked)
+                else:
+                    kernel32.CloseHandle(volume)
+
+            if not kernel32.FindNextVolumeW(find, buffer, len(buffer)):
+                break
+    finally:
+        kernel32.FindVolumeClose(find)
+
+    if not quiet:
+        if locked:
+            log(f"  Locked and dismounted {len(locked)} volume(s) on the "
+                "target disk.")
+        else:
+            log("  No mounted volumes on the target disk needed locking.")
+    return locked
+
+
+def _lock_volume(kernel32, volume, name: str, log) -> bool:
+    """Lock then force-dismount one volume handle; True if it is now held."""
+    import ctypes
+    from ctypes import wintypes
+
+    FSCTL_LOCK_VOLUME = 0x00090018
+    FSCTL_DISMOUNT_VOLUME = 0x00090020
+
+    returned = wintypes.DWORD(0)
+    locked = kernel32.DeviceIoControl(
+        volume, FSCTL_LOCK_VOLUME, None, 0, None, 0,
+        ctypes.byref(returned), None,
+    )
+    dismounted = kernel32.DeviceIoControl(
+        volume, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0,
+        ctypes.byref(returned), None,
+    )
+    if locked or dismounted:
+        log(f"    locked {name}")
+        return True
+    log(f"    (could not lock {name}: Windows error "
+        f"{ctypes.get_last_error()})")
+    return False
+
+
+def _unlock_and_close_volumes(kernel32, handles) -> None:
+    """Release the locks taken by `_lock_and_dismount_volumes`."""
+    import ctypes
+    from ctypes import wintypes
+
+    FSCTL_UNLOCK_VOLUME = 0x0009001C
+    for volume in handles:
+        returned = wintypes.DWORD(0)
+        kernel32.DeviceIoControl(
+            volume, FSCTL_UNLOCK_VOLUME, None, 0, None, 0,
+            ctypes.byref(returned), None,
+        )
+        kernel32.CloseHandle(volume)
+
+
 # -- Windows raw device writing --------------------------------------------
 def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
     import ctypes
@@ -1199,9 +1352,6 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
     FILE_SHARE_READ = 0x00000001
     FILE_SHARE_WRITE = 0x00000002
     OPEN_EXISTING = 3
-    FSCTL_LOCK_VOLUME = 0x00090018
-    FSCTL_DISMOUNT_VOLUME = 0x00090020
-    FSCTL_UNLOCK_VOLUME = 0x0009001C
     IOCTL_DISK_UPDATE_PROPERTIES = 0x00070100
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
@@ -1230,6 +1380,7 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
     ]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
+    disk_number = device.get("index")
     target = device["path"]
     log(f"Opening raw device {target} for writing ...")
 
@@ -1250,20 +1401,21 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
             "in use by another program."
         )
 
+    # Volumes we lock stay open (and locked) for the whole write and are
+    # released in the finally block below.
+    locked_volumes: list = []
+
     try:
-        # Take exclusive control so Windows stops caching/holding the volume.
-        # These control codes are really intended for volume handles, so on a
-        # physical-drive handle they can fail; automatic volume mounting is
-        # instead suppressed by WindowsRawAccessGuard around the pipeline, so
-        # a failure here is reported but not fatal.
-        for control in (FSCTL_LOCK_VOLUME, FSCTL_DISMOUNT_VOLUME):
-            returned = wintypes.DWORD(0)
-            if not kernel32.DeviceIoControl(
-                handle, control, None, 0, None, 0,
-                ctypes.byref(returned), None,
-            ):
-                log(f"  (DeviceIoControl 0x{control:08X} skipped: "
-                    f"Windows error {ctypes.get_last_error()})")
+        # Lock + force-dismount every mounted volume on this disk before the
+        # first raw write. Windows refuses raw writes that cross a mounted
+        # volume's extents with ERROR_ACCESS_DENIED (5); holding these locks
+        # removes that refusal.
+        if disk_number is None:
+            log("  (physical drive number unknown; skipping volume lock)")
+        else:
+            locked_volumes = _lock_and_dismount_volumes(
+                kernel32, disk_number, log,
+            )
 
         zero = ctypes.c_longlong(0)
         kernel32.SetFilePointerEx(handle, zero, None, 0)
@@ -1299,6 +1451,14 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
                 if err in (ERROR_ACCESS_DENIED, ERROR_NOT_READY,
                            ERROR_SEM_TIMEOUT) and retries_remaining:
                     retries_remaining -= 1
+                    if err == ERROR_ACCESS_DENIED and disk_number is not None:
+                        # A volume may have (re)mounted under us mid-write;
+                        # grab any that appeared before retrying.
+                        locked_volumes.extend(
+                            _lock_and_dismount_volumes(
+                                kernel32, disk_number, log, quiet=True,
+                            )
+                        )
                     log(f"  Retrying write at {format_bytes(offset)} "
                         f"(Windows error {err}) ...")
                     time.sleep(0.5)
@@ -1324,11 +1484,7 @@ def _flash_windows(image_path, device, total, progress, cancel, log) -> int:
             ctypes.byref(returned), None,
         )
     finally:
-        returned = wintypes.DWORD(0)
-        kernel32.DeviceIoControl(
-            handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0,
-            ctypes.byref(returned), None,
-        )
+        _unlock_and_close_volumes(kernel32, locked_volumes)
         kernel32.CloseHandle(handle)
 
     return written
@@ -1551,6 +1707,7 @@ class BananaFlasherApp(tk.Tk):
         # Initial work
         self.refresh_devices()
         self._query_release_async()
+        self._report_elevation_status()
 
     # --------------------------------------------------------------- branding
     def _apply_window_icon(self) -> None:
@@ -1993,6 +2150,19 @@ class BananaFlasherApp(tk.Tk):
         return messagebox.askyesno(
             "Confirm destructive write", message, icon="warning", default="no",
         )
+
+    def _report_elevation_status(self) -> None:
+        """Log whether we currently have the rights to write raw devices."""
+        if is_elevated():
+            self.log("Elevated privileges detected.")
+            return
+        if IS_WINDOWS:
+            self.log("WARNING: not running as Administrator. Writing to a "
+                     "physical drive requires elevation -- you will be "
+                     "prompted to relaunch when you start a flash.")
+        else:
+            self.log("Not running as root; you will be asked for your sudo "
+                     "password when you start a flash.")
 
     def _ensure_privileges(self) -> bool:
         from tkinter import messagebox

@@ -31,9 +31,25 @@ you by [GitHub Actions](.github/workflows/build-exe.yml) on every `v*` tag.
 
 > Windows may show a SmartScreen notice for this unsigned community build.
 > Choose **More info → Run anyway**.
->
-> Linux and macOS users: run from source (see below). Pre-built binaries are
-> currently published for Windows only.
+
+## ⬇️ Download for Linux (AppImage)
+
+**No Python required.** Grab `BananaLinuxFlasher-<version>-x86_64.AppImage`
+from the [latest GitHub Release](https://github.com/jesussaves-ai/banana-linux-flasher/releases/latest):
+
+```bash
+chmod +x BananaLinuxFlasher-*-x86_64.AppImage
+./BananaLinuxFlasher-*-x86_64.AppImage
+```
+
+The app asks for your `sudo` password in its own dialog when you start a flash
+(raw device access needs root). It relies on the standard tools `sudo`, `dd`,
+`lsblk`, `wipefs` and `findmnt`, which are present on virtually every desktop
+distro. It is built by [GitHub Actions](.github/workflows/build-appimage.yml)
+on every `v*` tag.
+
+> macOS users: run from source (see below). No pre-built macOS binary is
+> published.
 
 ---
 
@@ -91,10 +107,13 @@ device — nothing is ever written to an intermediate uncompressed file:
 * **macOS** — pipes into `sudo dd of=/dev/rdiskX bs=4m conv=fsync`, then ejects
 * **Windows** — writes chunks to `\\.\PhysicalDriveN` via `CreateFileW` /
   `WriteFile` / `FlushFileBuffers`, retrying transient failures at the exact
-  byte offset. Automatic volume mounting (`mountvol /N`) and the Shell Hardware
-  Detection service are paused for the duration of the write and restored
-  afterwards, so Windows cannot grab the freshly written Linux partitions
-  mid-flash.
+  byte offset. Before writing it enumerates every volume on the target disk
+  (`FindFirstVolumeW` + `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`), locks and
+  force-dismounts each one (`FSCTL_LOCK_VOLUME` / `FSCTL_DISMOUNT_VOLUME`), and
+  holds those locks until the flash finishes. Automatic volume mounting
+  (`mountvol /N`) and the Shell Hardware Detection service are also paused for
+  the duration and restored afterwards, so Windows cannot grab the freshly
+  written Linux partitions mid-flash.
 
 ---
 
@@ -194,6 +213,26 @@ The binary is written to `dist\BananaLinuxFlasher.exe`. The same command is run
 automatically by [`.github/workflows/build-exe.yml`](.github/workflows/build-exe.yml),
 which triggers on `v*` tags and manual `workflow_dispatch`, uploads the executable
 as a build artifact, and attaches it to the GitHub Release for tagged builds.
+
+---
+
+## Building the Linux AppImage
+
+[`scripts/build_appimage.sh`](scripts/build_appimage.sh) builds the Linux binary
+with PyInstaller, wraps it in an AppDir, and produces a portable AppImage with
+[`appimagetool`](https://github.com/AppImage/appimagetool):
+
+```bash
+python3 -m pip install --user pyinstaller   # or use a venv
+./scripts/build_appimage.sh
+```
+
+The result is written to `dist/BananaLinuxFlasher-<version>-<arch>.AppImage`.
+The same script is run by
+[`.github/workflows/build-appimage.yml`](.github/workflows/build-appimage.yml)
+on every `v*` tag. `appimagetool` is downloaded automatically on first run, and
+the build uses `--appimage-extract-and-run`, so it works without FUSE (containers
+and CI included).
 
 ---
 
