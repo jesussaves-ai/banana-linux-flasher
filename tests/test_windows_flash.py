@@ -89,6 +89,12 @@ def make_fake_kernel32(state: FakeDiskState):
     def always_ok(handle):
         return 1
 
+    def find_first_volume(buffer, size):
+        return ctypes.c_void_p(-1).value  # INVALID_HANDLE_VALUE: no volumes
+
+    def find_next_volume(find, buffer, size):
+        return 0
+
     kernel = types.SimpleNamespace(
         CreateFileW=create_file,
         WriteFile=write_file,
@@ -96,6 +102,9 @@ def make_fake_kernel32(state: FakeDiskState):
         DeviceIoControl=device_io,
         FlushFileBuffers=always_ok,
         CloseHandle=always_ok,
+        FindFirstVolumeW=find_first_volume,
+        FindNextVolumeW=find_next_volume,
+        FindVolumeClose=always_ok,
     )
     # _flash_windows assigns .restype/.argtypes on these; harmless on fakes.
     for fn in vars(kernel).values():
@@ -133,7 +142,7 @@ class FlashWindowsWriteTests(unittest.TestCase):
              mock.patch.object(fb.time, "sleep", new=lambda *_: None):
             return fb._flash_windows(
                 self.image,
-                {"path": r"\\.\PhysicalDrive2"},
+                {"path": r"\\.\PhysicalDrive2", "index": 2},
                 len(self.content),
                 lambda *args: None,
                 threading.Event(),
@@ -247,6 +256,134 @@ class RawAccessGuardTests(unittest.TestCase):
             with fb.WindowsRawAccessGuard(lambda _m: None):
                 pass
         self.assertEqual(events, [])
+
+
+# ---------------------------------------------------------------------------
+#  Volume enumeration / locking
+# ---------------------------------------------------------------------------
+IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+FSCTL_LOCK_VOLUME = 0x00090018
+FSCTL_DISMOUNT_VOLUME = 0x00090020
+FSCTL_UNLOCK_VOLUME = 0x0009001C
+
+
+class FakeVolumeKernel32:
+    """Minimal kernel32 fake exposing a set of volumes on given disks."""
+
+    def __init__(self, volumes, lock_ok=True):
+        self.volumes = list(volumes)          # [(name, disk_number), ...]
+        self.lock_ok = lock_ok
+        self._cursor = -1
+        self._next = 100
+        self.by_handle = {}                   # handle -> (name, disk)
+        self.locked = []
+        self.dismounted = []
+        self.unlocked = []
+        self.closed = []
+
+        def find_first_volume(buffer, size):
+            if not self.volumes:
+                return ctypes.c_void_p(-1).value
+            self._cursor = 0
+            buffer.value = self.volumes[0][0]
+            return 0xF1
+
+        def find_next_volume(find, buffer, size):
+            self._cursor += 1
+            if self._cursor < len(self.volumes):
+                buffer.value = self.volumes[self._cursor][0]
+                return 1
+            return 0
+
+        def create_file(name, access, share, sec, disp, flags, tmpl):
+            self._next += 1
+            handle = self._next
+            disk = next((d for n, d in self.volumes if n == name), None)
+            self.by_handle[handle] = (name, disk)
+            return handle
+
+        def device_io(handle, code, inbuf, inlen, outbuf, outlen, returned,
+                      overlapped):
+            if code == IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS:
+                extents = outbuf._obj
+                extents.NumberOfDiskExtents = 1
+                extents.Extents[0].DiskNumber = self.by_handle[handle][1]
+                return 1
+            if code == FSCTL_LOCK_VOLUME:
+                if not self.lock_ok:
+                    return 0
+                self.locked.append(handle)
+                return 1
+            if code == FSCTL_DISMOUNT_VOLUME:
+                if not self.lock_ok:
+                    return 0
+                self.dismounted.append(handle)
+                return 1
+            if code == FSCTL_UNLOCK_VOLUME:
+                self.unlocked.append(handle)
+                return 1
+            return 1
+
+        def close(handle):
+            self.closed.append(handle)
+            return 1
+
+        self.CreateFileW = create_file
+        self.DeviceIoControl = device_io
+        self.FindFirstVolumeW = find_first_volume
+        self.FindNextVolumeW = find_next_volume
+        self.FindVolumeClose = close
+        self.CloseHandle = close
+        for fn in (create_file, device_io, find_first_volume, find_next_volume,
+                   close):
+            fn.restype = None
+            fn.argtypes = []
+
+
+class VolumeLockTests(unittest.TestCase):
+    def setUp(self):
+        # ctypes.get_last_error() is Windows-only; stub it for the failure logs.
+        patcher = mock.patch.object(ctypes, "get_last_error", create=True,
+                                    new=lambda: 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_locks_and_dismounts_only_target_disk_volumes(self):
+        volumes = [
+            ("\\\\?\\Volume{aaa}\\", 5),
+            ("\\\\?\\Volume{bbb}\\", 5),
+            ("\\\\?\\Volume{ccc}\\", 0),
+        ]
+        k = FakeVolumeKernel32(volumes)
+        held = fb._lock_and_dismount_volumes(k, 5, lambda _m: None)
+
+        self.assertEqual(len(held), 2)
+        self.assertEqual(sorted(k.locked), sorted(held))
+        self.assertEqual(sorted(k.dismounted), sorted(held))
+
+        other = next(h for h, (n, d) in k.by_handle.items() if d == 0)
+        self.assertIn(other, k.closed)      # opened, then closed untouched
+        self.assertNotIn(other, k.locked)
+
+    def test_release_unlocks_and_closes(self):
+        k = FakeVolumeKernel32([("\\\\?\\Volume{aaa}\\", 5)])
+        held = fb._lock_and_dismount_volumes(k, 5, lambda _m: None)
+        fb._unlock_and_close_volumes(k, held)
+        self.assertEqual(k.unlocked, held)
+        for handle in held:
+            self.assertIn(handle, k.closed)
+
+    def test_lock_failure_is_skipped(self):
+        k = FakeVolumeKernel32([("\\\\?\\Volume{aaa}\\", 5)], lock_ok=False)
+        held = fb._lock_and_dismount_volumes(k, 5, lambda _m: None)
+        self.assertEqual(held, [])
+        self.assertEqual(k.locked, [])
+        self.assertTrue(k.closed)           # un-lockable handle was released
+
+    def test_no_volumes_is_handled(self):
+        k = FakeVolumeKernel32([])
+        held = fb._lock_and_dismount_volumes(k, 5, lambda _m: None)
+        self.assertEqual(held, [])
 
 
 if __name__ == "__main__":
