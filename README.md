@@ -331,7 +331,9 @@ cannot be pointed at the system disk.
 * This tool is unaffiliated with Anbernic. BananaLinux is a separate community
   project; upstream releases are currently published as pre-releases.
 * Windows and macOS code paths are implemented against the documented system APIs
-  but are best verified on the real OS before trusting them with a card.---
+  but are best verified on the real OS before trusting them with a card.
+
+---
 
 ## Support
 
